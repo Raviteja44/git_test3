@@ -1,0 +1,71 @@
+name: 7. Cleanup Temp Branches
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    # Only run when PR is merged (not just closed)
+    if: github.event.pull_request.merged == true
+    
+    steps:
+      - name: Extract branch info
+        id: extract
+        run: |
+          BRANCH_NAME="${{ github.event.pull_request.head.ref }}"
+          echo "branch_name=${BRANCH_NAME}" >> $GITHUB_OUTPUT
+          
+          # Check if it's a temp promotion branch and NOT a protected branch
+          if [[ "$BRANCH_NAME" =~ ^promote/ ]] && \
+             [[ "$BRANCH_NAME" != "main" ]] && \
+             [[ "$BRANCH_NAME" != "dev" ]] && \
+             [[ "$BRANCH_NAME" != "uat" ]] && \
+             [[ ! "$BRANCH_NAME" =~ ^feature/ ]]; then
+            echo "should_delete=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_delete=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Skip if not a temp branch
+        if: steps.extract.outputs.should_delete == 'false'
+        run: |
+          echo " Skipping deletion - '${{ steps.extract.outputs.branch_name }}' is not a temporary promotion branch or is protected"
+          echo "Protected branches: main, dev, uat, feature/* are preserved"
+
+      - name: Delete temp branch via GitHub API
+        if: steps.extract.outputs.should_delete == 'true'
+        run: |
+          BRANCH="${{ steps.extract.outputs.branch_name }}"
+          OWNER="${{ github.repository_owner }}"
+          REPO="${{ github.event.repository.name }}"
+          
+          echo " Deleting temporary branch: $BRANCH"
+          
+          # Use GitHub API to delete the branch - NO GIT COMMANDS!
+          response_code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${OWNER}/${REPO}/git/refs/heads/${BRANCH}")
+          
+          echo "HTTP Response Code: $response_code"
+          
+          if [ "$response_code" -eq 422 ]; then
+            echo " Branch '$BRANCH' was already deleted or doesn't exist"
+          elif [ "$response_code" -eq 204 ]; then
+            echo " Successfully deleted branch: $BRANCH"
+          else
+            echo " Failed to delete branch: $BRANCH (HTTP $response_code)"
+            # Don't fail the workflow for deletion errors
+          fi
+
+      - name: Completion summary
+        run: |
+          echo " Cleanup process completed for PR #${{ github.event.pull_request.number }}"
+          echo "Branch: '${{ steps.extract.outputs.branch_name }}'"
+          echo "Action: ${{ steps.extract.outputs.should_delete == 'true' && 'DELETED' || 'SKIPPED' }}"

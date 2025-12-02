@@ -1,0 +1,41 @@
+name: 6. Deploy to S3 (PROD)
+
+on:
+  push:
+    branches:
+      - prod
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-west-2
+  S3_BUCKET: ${{ secrets.PROD_S3_BUCKET }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout prod
+        uses: actions/checkout@v4
+        with:
+          ref: prod
+          fetch-depth: 0
+
+      - name: Configure AWS credentials (PROD)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.PROD_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.PROD_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS & sync to S3 (PROD)
+        run: |
+          echo "Deploying branch 'prod' to s3://${S3_BUCKET}"
+          aws s3 sync . "s3://${S3_BUCKET}" \
+            --delete \
+            --exclude ".git/*" \
+            --exclude ".github/*" \
+            --exclude ".venv/*" \
+            --exclude "venv/*"

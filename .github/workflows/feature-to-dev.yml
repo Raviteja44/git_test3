@@ -1,0 +1,163 @@
+name: 1. Promote Feature to Dev
+
+on:
+  workflow_dispatch:
+    inputs:
+      feature_branch:
+        description: "Feature branch name (example: feature/edp_opt_JIRA-123)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout dev branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: dev
+
+      - name: Fetch all remote branches
+        run: |
+          git fetch origin +refs/heads/*:refs/remotes/origin/* --prune
+
+      - name: Verify feature branch exists
+        run: |
+          FEATURE="${{ github.event.inputs.feature_branch }}"
+          if ! git show-ref --verify --quiet "refs/remotes/origin/${FEATURE}"; then
+            echo "ERROR: Feature branch origin/${FEATURE} not found."
+            exit 1
+          fi
+
+      - name: Check if feature branch is behind dev
+        run: |
+          FEATURE="${{ github.event.inputs.feature_branch }}"
+
+          if git merge-base --is-ancestor origin/dev "origin/${FEATURE}"; then
+            echo "Feature branch contains latest dev. OK to proceed."
+          else
+            echo "ERROR: Feature branch is behind dev. Please update your branch with the latest dev and retry."
+            exit 1
+          fi
+
+      - name: Extract Jira ID
+        id: jira
+        run: |
+          FEATURE="${{ github.event.inputs.feature_branch }}"
+          JIRA_ID=$(echo "$FEATURE" | grep -oE "JIRA-[0-9]+")
+
+          if [ -z "$JIRA_ID" ]; then
+            echo "ERROR: Jira ID not found in branch name. Expected pattern: JIRA-123."
+            exit 1
+          fi
+
+          echo "jira_id=$JIRA_ID" >> $GITHUB_ENV
+
+      - name: Check for differences
+        id: diffcheck
+        run: |
+          FEATURE="${{ github.event.inputs.feature_branch }}"
+
+          if git diff --quiet origin/dev "origin/${FEATURE}"; then
+            echo "has_diff=false" >> $GITHUB_ENV
+          else
+            echo "has_diff=true" >> $GITHUB_ENV
+          fi
+
+      - name: Stop workflow if no differences
+        if: env.has_diff == 'false'
+        run: |
+          echo "No differences detected between feature branch and dev. PR will not be created."
+          exit 0
+
+      - name: Prepare PR Content
+        id: prepare
+        run: |
+          FEATURE="${{ github.event.inputs.feature_branch }}"
+
+          FILES=$(git diff --name-only origin/dev "origin/${FEATURE}")
+          COMMITS=$(git log origin/dev.."origin/${FEATURE}" --pretty=format:"- %s (%h)")
+
+          echo "FILES<<EOF" >> $GITHUB_ENV
+          echo "$FILES" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+          echo "COMMITS<<EOF" >> $GITHUB_ENV
+          echo "$COMMITS" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Create Pull Request (using PAT)
+        id: create_pr
+        run: |
+          FEATURE="${{ github.event.inputs.feature_branch }}"
+          JIRA_ID="${{ env.jira_id }}"
+          BODY_FILE="body.txt"
+
+          echo "Automated Promotion PR" > $BODY_FILE
+          echo "Jira ID: ${JIRA_ID}" >> $BODY_FILE
+          echo "Source branch: ${FEATURE}" >> $BODY_FILE
+          echo "Target branch: dev" >> $BODY_FILE
+          echo "" >> $BODY_FILE
+          echo "Changed Files:" >> $BODY_FILE
+          echo "${FILES}" >> $BODY_FILE
+          echo "" >> $BODY_FILE
+          echo "Commit Messages:" >> $BODY_FILE
+          echo "${COMMITS}" >> $BODY_FILE
+
+          PAYLOAD=$(jq -n \
+            --arg title "[${JIRA_ID}] Promote changes from ${FEATURE} to dev" \
+            --arg head "$FEATURE" \
+            --arg base "dev" \
+            --arg body "$(cat body.txt)" \
+            '{title:$title, head:$head, base:$base, body:$body}')
+
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls")
+
+          echo "$RESPONSE" > pr_response.json
+          PR_NUMBER=$(jq '.number' pr_response.json)
+
+          if [ "$PR_NUMBER" = "null" ]; then
+            echo "ERROR: Failed to create PR. API response:"
+            cat pr_response.json
+            exit 1
+          fi
+
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_ENV
+          echo "Created PR #$PR_NUMBER"
+
+      - name: Update PR Body With PR ID
+        run: |
+          PR_NUM="${{ env.pr_number }}"
+
+          PAYLOAD=$(jq -n \
+            --arg body "$(cat body.txt)\n\nPR ID: ${PR_NUM}" \
+            '{body:$body}')
+
+          curl -s -X PATCH \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${PR_NUM}"
+
+      - name: Apply Jira and environment labels
+        run: |
+          PR_NUM="${{ env.pr_number }}"
+          JIRA_ID="${{ env.jira_id }}"
+
+          LABELS=$(jq -n --arg jira "$JIRA_ID" '{labels: [$jira, "feature-to-dev"]}')
+
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$LABELS" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUM}/labels"

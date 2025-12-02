@@ -1,0 +1,41 @@
+name: 4. Deploy to S3 (UAT)
+
+on:
+  push:
+    branches:
+      - uat
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-west-2
+  S3_BUCKET: ${{ secrets.UAT_S3_BUCKET }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout uat
+        uses: actions/checkout@v4
+        with:
+          ref: uat
+          fetch-depth: 0
+
+      - name: Configure AWS credentials (UAT)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.UAT_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.UAT_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS & sync to S3 (UAT)
+        run: |
+          echo "Deploying branch 'uat' to s3://${S3_BUCKET}"
+          aws s3 sync . "s3://${S3_BUCKET}" \
+            --delete \
+            --exclude ".git/*" \
+            --exclude ".github/*" \
+            --exclude ".venv/*" \
+            --exclude "venv/*"

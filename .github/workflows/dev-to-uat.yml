@@ -1,0 +1,215 @@
+name: 3. Promote Dev → UAT
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number that was merged into dev"
+        required: true
+        type: number
+      source_branch:
+        description: "Source branch: dev"
+        required: true
+        type: choice
+        options:
+          - dev
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup Git and tools
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch all remote branches
+        run: |
+          git fetch origin +refs/heads/*:refs/remotes/origin/* --prune
+
+      - name: Validate PR exists, is merged, and targeted dev
+        id: validate
+        run: |
+          PR="${{ github.event.inputs.pr_number }}"
+
+          PR_JSON=$(curl -s \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${PR}")
+
+          if [[ "$(echo "$PR_JSON" | jq -r '.message')" != "null" ]]; then
+            echo "ERROR: PR #$PR not found."
+            exit 1
+          fi
+
+          MERGED=$(echo "$PR_JSON" | jq -r '.merged')
+          BASE=$(echo "$PR_JSON" | jq -r '.base.ref')
+
+          if [[ "$MERGED" != "true" ]]; then
+            echo "ERROR: PR #$PR is not merged into dev."
+            exit 1
+          fi
+
+          if [[ "$BASE" != "dev" ]]; then
+            echo "ERROR: PR #$PR must have been merged into dev (found: $BASE)."
+            exit 1
+          fi
+
+          LAST_SHA=$(curl -s \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${PR}/commits" \
+            | jq -r '.[-1].sha')
+
+          echo "pr_number=$PR" >> $GITHUB_OUTPUT
+          echo "pr_last_sha=$LAST_SHA" >> $GITHUB_OUTPUT
+
+      - name: Extract Jira ID from PR metadata
+        id: jira
+        run: |
+          PR="${{ steps.validate.outputs.pr_number }}"
+
+          PR_JSON=$(curl -s \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${PR}")
+
+          JIRA_ID=$(echo "$PR_JSON" | grep -oE "JIRA-[0-9]+" | head -n 1)
+
+          if [[ -z "$JIRA_ID" ]]; then
+            echo "ERROR: No Jira ID found in PR."
+            exit 1
+          fi
+
+          echo "jira_id=$JIRA_ID" >> $GITHUB_ENV
+
+      - name: Download PR diff
+        run: |
+          PR="${{ steps.validate.outputs.pr_number }}"
+          curl -s \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3.diff" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${PR}" \
+            > pr.diff
+
+          if [[ ! -s pr.diff ]]; then
+            echo "ERROR: PR diff is empty."
+            exit 1
+          fi
+
+      - name: Create temporary promote branch from uat
+        id: create_branch
+        run: |
+          PR="${{ steps.validate.outputs.pr_number }}"
+          TS=$(date +%s)
+          BRANCH="promote/dev-to-uat-${TS}-pr${PR}"
+
+          git checkout -b "$BRANCH" origin/uat
+
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Apply PR diff and push temp branch
+        run: |
+          BRANCH="${{ steps.create_branch.outputs.branch }}"
+
+          if ! git apply --index pr.diff; then
+            echo "ERROR: Diff could not be applied cleanly to UAT."
+            exit 1
+          fi
+
+          git commit -m "Promote PR #${{ steps.validate.outputs.pr_number }} changes into uat"
+          git push origin "HEAD:$BRANCH"
+
+      - name: Build PR body content
+        id: body
+        run: |
+          BR="${{ steps.create_branch.outputs.branch }}"
+          PR="${{ steps.validate.outputs.pr_number }}"
+          JIRA="${{ env.jira_id }}"
+
+          FILES=$(git diff --name-only origin/uat..origin/$BR)
+          COMMITS=$(curl -s \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${PR}/commits" \
+            | jq -r '.[] | "- " + (.commit.message | split("\n")[0]) + " (" + (.sha[:7]) + ")"')
+
+          echo "Automated Promotion PR" > body.txt
+          echo "" >> body.txt
+          echo "Jira ID: ${JIRA}" >> body.txt
+          echo "Source PR: #$PR (merged into dev)" >> body.txt
+          echo "Target branch: uat" >> body.txt
+          echo "" >> body.txt
+          echo "Changed files:" >> body.txt
+          echo "$FILES" >> body.txt
+          echo "" >> body.txt
+          echo "Commit messages:" >> body.txt
+          echo "$COMMITS" >> body.txt
+
+      - name: Create PR into uat
+        id: create_pr
+        run: |
+          BR="${{ steps.create_branch.outputs.branch }}"
+          JIRA="${{ env.jira_id }}"
+
+          PAYLOAD=$(jq -n \
+            --arg title "[${JIRA}] Promote changes from dev to uat" \
+            --arg head "$BR" \
+            --arg base "uat" \
+            --arg body "$(cat body.txt)" \
+            '{title:$title, head:$head, base:$base, body:$body}')
+
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls")
+
+          echo "$RESPONSE" > created.json
+          PR_NUM=$(jq -r '.number' created.json)
+
+          if [[ "$PR_NUM" = "null" ]]; then
+            echo "ERROR creating PR: $(jq -r '.message' created.json)"
+            exit 1
+          fi
+
+          echo "created_pr=$PR_NUM" >> $GITHUB_OUTPUT
+
+      - name: Add PR ID at bottom of body
+        run: |
+          PR="${{ steps.create_pr.outputs.created_pr }}"
+
+          PAYLOAD=$(jq -n \
+            --arg body "$(cat body.txt)\n\nPR ID: ${PR}" \
+            '{body:$body}')
+
+          curl -s -X PATCH \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${PR}"
+
+      - name: Apply Jira and environment labels
+        run: |
+          PR="${{ steps.create_pr.outputs.created_pr }}"
+          JIRA="${{ env.jira_id }}"
+
+          LABELS=$(jq -n --arg jira "$JIRA" '{labels: [$jira, "dev-to-uat"]}')
+
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$LABELS" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${PR}/labels"
+
+      - name: Completed
+        run: |
+          echo "Promotion Dev → UAT completed successfully."
