@@ -23,6 +23,7 @@ from airflow.operators.email_operator import EmailOperator
 from redshift_utils import redshift_connection as rs
 import pprint
 from datetime import datetime, date, timedelta
+45469bg
 import calendar
 import boto3
 import json
